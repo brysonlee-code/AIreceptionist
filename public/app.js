@@ -2,7 +2,7 @@
 // Pink Print Voice CRM — dashboard frontend
 // ═══════════════════════════════════════════════════════════
 
-let state = { view: 'dashboard', overview: null, calls: [], payments: [], patients: [], fees: [], activeCall: null, simCall: null };
+let state = { view: 'dashboard', overview: null, calls: [], payments: [], patients: [], fees: [], activeCall: null, simCall: null, reports: null, earnings: null };
 let modal = null;
 
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -40,6 +40,9 @@ const I = {
   end: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 01-2.18 2A19.86 19.86 0 013 5.18 2 2 0 015 3h3a2 2 0 012 1.72"/><line x1="23" y1="1" x2="1" y2="23"/></svg>',
   trash: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>',
   link: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>',
+  chart: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>',
+  dollar: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>',
+  refresh: '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>',
 };
 
 function toast(msg) { const t = document.createElement('div'); t.className = 'toast'; t.innerHTML = `${I.check} ${esc(msg)}`; document.body.appendChild(t); setTimeout(() => t.remove(), 2400); }
@@ -54,6 +57,8 @@ function render() {
     ['dashboard', 'Dashboard', I.dash, null],
     ['calls', 'Calls', I.phone, state.calls.length],
     ['payments', 'Payments', I.card, state.payments.length],
+    ['reports', 'Reports', I.chart, null],
+    ['earnings', 'Earnings', I.dollar, null],
     ['patients', 'Clients', I.users, state.patients.length],
     ['fees', 'Service menu', I.tag, state.fees.length],
     ['simulator', 'Test the agent', I.mic, null],
@@ -88,6 +93,8 @@ function renderView() {
     case 'dashboard': return viewDashboard();
     case 'calls': return viewCalls();
     case 'payments': return viewPayments();
+    case 'reports': return viewReports();
+    case 'earnings': return viewEarnings();
     case 'patients': return viewPatients();
     case 'fees': return viewFees();
     case 'simulator': return viewSimulator();
@@ -284,6 +291,231 @@ async function saveFee() {
   closeModal(); toast('Service added'); await refresh();
 }
 async function delFee(id) { if (confirm('Remove this service?')) { await api.del('/fees/' + id); await refresh(); } }
+
+// ── SVG CHART HELPERS ───────────────────────────────────────
+const CHART_COLORS = ['#E91E8C', '#B14FC4', '#16A34A', '#D97706', '#3B82F6', '#EF4444', '#8B5CF6', '#06B6D4', '#F59E0B', '#10B981', '#6366F1', '#EC4899'];
+
+function svgBarChart(data, { width = 560, height = 200, labelKey = 'day', valueKey = 'count', color = '#E91E8C' } = {}) {
+  if (!data.length) return '<p class="hint">No data</p>';
+  const max = Math.max(...data.map(d => d[valueKey]), 1);
+  const pad = { top: 10, right: 10, bottom: 30, left: 40 };
+  const cw = width - pad.left - pad.right;
+  const ch = height - pad.top - pad.bottom;
+  const bw = Math.max(2, (cw / data.length) - 2);
+  const bars = data.map((d, i) => {
+    const x = pad.left + (i * cw / data.length) + 1;
+    const h = (d[valueKey] / max) * ch;
+    const y = pad.top + ch - h;
+    return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${color}" rx="2"><title>${d[labelKey]}: ${d[valueKey]}</title></rect>`;
+  }).join('');
+  // Y-axis labels
+  const yLabels = [0, Math.round(max / 2), max].map((v, i) => {
+    const y = pad.top + ch - (v / max) * ch;
+    return `<text x="${pad.left - 6}" y="${y + 4}" text-anchor="end" font-size="10" fill="#A38B97">${v}</text>`;
+  }).join('');
+  // X-axis labels (show every Nth)
+  const step = Math.max(1, Math.floor(data.length / 8));
+  const xLabels = data.filter((_, i) => i % step === 0).map((d, i) => {
+    const idx = data.indexOf(d);
+    const x = pad.left + (idx * cw / data.length) + bw / 2;
+    return `<text x="${x}" y="${height - 6}" text-anchor="middle" font-size="10" fill="#A38B97">${d[labelKey]}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" style="max-width:${width}px">${bars}${yLabels}${xLabels}</svg>`;
+}
+
+function svgDonutChart(data, { size = 160, nameKey = 'name', valueKey = 'count' } = {}) {
+  const total = data.reduce((s, d) => s + d[valueKey], 0);
+  if (!total) return '<p class="hint">No data</p>';
+  const cx = size / 2, cy = size / 2, r = size * 0.38, sw = size * 0.14;
+  let angle = -90;
+  const paths = data.map((d, i) => {
+    const pct = d[valueKey] / total;
+    const a1 = (angle * Math.PI) / 180;
+    angle += pct * 360;
+    const a2 = (angle * Math.PI) / 180;
+    const large = pct > 0.5 ? 1 : 0;
+    const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+    const x2 = cx + r * Math.cos(a2), y2 = cy + r * Math.sin(a2);
+    const color = CHART_COLORS[i % CHART_COLORS.length];
+    return `<path d="M${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2}" fill="none" stroke="${color}" stroke-width="${sw}"><title>${d[nameKey]}: ${d[valueKey]} (${Math.round(pct * 100)}%)</title></path>`;
+  }).join('');
+  const legend = data.map((d, i) => `<div class="legend-item"><span class="legend-dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>${esc(d[nameKey])}: <strong>${d[valueKey]}</strong></div>`).join('');
+  return `<div class="donut-layout"><svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">${paths}<text x="${cx}" y="${cy + 5}" text-anchor="middle" font-size="20" font-weight="800" fill="#2B1B25">${total}</text></svg><div class="legend">${legend}</div></div>`;
+}
+
+function svgSparkline(data, { width = 280, height = 80, valueKey = 'avg', color = '#B14FC4' } = {}) {
+  if (!data.length) return '<p class="hint">No data</p>';
+  const max = Math.max(...data.map(d => d[valueKey]), 1);
+  const pad = 4;
+  const cw = width - pad * 2, ch = height - pad * 2;
+  const points = data.map((d, i) => {
+    const x = pad + (i / (data.length - 1 || 1)) * cw;
+    const y = pad + ch - (d[valueKey] / max) * ch;
+    return `${x},${y}`;
+  }).join(' ');
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" style="max-width:${width}px"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+function svgHourChart(hourCounts, { width = 480, height = 120 } = {}) {
+  const max = Math.max(...hourCounts, 1);
+  const pad = { top: 8, right: 4, bottom: 22, left: 4 };
+  const cw = width - pad.left - pad.right;
+  const ch = height - pad.top - pad.bottom;
+  const bw = (cw / 24) - 2;
+  const bars = hourCounts.map((v, i) => {
+    const x = pad.left + i * (cw / 24) + 1;
+    const h = (v / max) * ch;
+    const y = pad.top + ch - h;
+    const pct = v / max;
+    const color = pct > 0.7 ? '#E91E8C' : pct > 0.3 ? '#D97706' : '#16A34A';
+    return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${color}" rx="1.5"><title>${i}:00 — ${v} calls</title></rect>`;
+  }).join('');
+  const labels = [0, 6, 12, 18, 23].map(h => {
+    const x = pad.left + h * (cw / 24) + bw / 2;
+    return `<text x="${x}" y="${height - 4}" text-anchor="middle" font-size="9" fill="#A38B97">${h}:00</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" style="max-width:${width}px">${bars}${labels}</svg>`;
+}
+
+function svgFunnel(stages, { width = 500 } = {}) {
+  const max = Math.max(...stages.map(s => s.count), 1);
+  return stages.map((s, i) => {
+    const pct = (s.count / max) * 100;
+    const color = CHART_COLORS[i % CHART_COLORS.length];
+    return `<div class="funnel-row">
+      <div class="funnel-name">${esc(s.stage)}</div>
+      <div class="funnel-track"><div class="funnel-fill" style="width:${Math.max(pct, 8)}%;background:${color}">${Math.round(pct)}%</div></div>
+      <div class="funnel-count">${s.count}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── REPORTS ─────────────────────────────────────────────────
+async function loadReports(force) {
+  if (state.reports && !force) return;
+  state.reports = await api.get('/reports');
+  render();
+}
+
+function viewReports() {
+  loadReports();
+  const r = state.reports;
+  if (!r) return `${topbar('Reports', 'Loading analytics...')}<div class="content"><p class="hint">Loading...</p></div>`;
+  return `
+    ${topbar('Reports', 'Call analytics and performance metrics', `<button class="btn btn-sm" onclick="loadReports(true)">${I.refresh} Refresh</button>`)}
+    <div class="content">
+      <div class="chart-panel" style="margin-bottom:24px">
+        <div class="chart-panel-head">Call volume — last 30 days</div>
+        <div class="chart-panel-body">${svgBarChart(r.callsByDay)}</div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-panel">
+          <div class="chart-panel-head">Peak hours</div>
+          <div class="chart-panel-body">${svgHourChart(r.hourCounts)}</div>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-panel-head">Avg call duration trend</div>
+          <div class="chart-panel-body">${svgSparkline(r.avgDurationByDay, { width: 420, height: 100, valueKey: 'avg', color: '#E91E8C' })}</div>
+        </div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-panel">
+          <div class="chart-panel-head">Intent breakdown</div>
+          ${svgDonutChart(r.intents)}
+        </div>
+        <div class="chart-panel">
+          <div class="chart-panel-head">Sentiment breakdown</div>
+          ${svgDonutChart(r.sentiments)}
+        </div>
+      </div>
+      <div class="chart-panel" style="margin-bottom:24px">
+        <div class="chart-panel-head">Conversion funnel</div>
+        <div class="chart-panel-body">${svgFunnel(r.funnel)}</div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-panel">
+          <div class="chart-panel-head">Top callers</div>
+          <div class="chart-panel-body">
+            <table style="width:100%">
+              <thead><tr><th>Caller</th><th>Phone</th><th style="text-align:right">Calls</th></tr></thead>
+              <tbody>${r.topCallers.map(c => `<tr><td class="contact-name">${esc(c.name || 'Unknown')}</td><td style="font-family:var(--mono);font-size:12px">${esc(c.phone)}</td><td style="text-align:right;font-weight:700">${c.count}</td></tr>`).join('') || '<tr><td colspan="3" class="hint" style="text-align:center;padding:20px">No callers yet</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-panel-head">Agent performance</div>
+          ${svgDonutChart(r.agentPerformance)}
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── EARNINGS ────────────────────────────────────────────────
+async function loadEarnings(force) {
+  if (state.earnings && !force) return;
+  state.earnings = await api.get('/earnings');
+  render();
+}
+
+function viewEarnings() {
+  loadEarnings();
+  const e = state.earnings;
+  if (!e) return `${topbar('Earnings', 'Loading revenue data...')}<div class="content"><p class="hint">Loading...</p></div>`;
+  return `
+    ${topbar('Earnings', 'Revenue analytics and financial performance', `<button class="btn btn-sm" onclick="loadEarnings(true)">${I.refresh} Refresh</button>`)}
+    <div class="content">
+      <div class="stat-grid-8">
+        ${stat('All-time revenue', money(e.totals.allTime), 'total collected', true)}
+        ${stat('This month', money(e.totals.thisMonth), 'current month')}
+        ${stat('This week', money(e.totals.thisWeek), 'last 7 days')}
+        ${stat('Today', money(e.totals.today), 'so far today')}
+        ${stat('Avg transaction', money(e.avgTransaction), 'per payment')}
+        ${stat('Revenue / call', money(e.revenuePerCall), 'per call average')}
+        ${stat('Outstanding', money(e.outstanding), 'unpaid links')}
+        ${stat('Projected monthly', money(e.projectedMonthly), 'based on 30-day avg', true)}
+      </div>
+      <div class="chart-panel" style="margin-bottom:24px">
+        <div class="chart-panel-head">Monthly revenue — last 12 months</div>
+        <div class="chart-panel-body">${svgBarChart(e.monthlyRevenue, { labelKey: 'month', valueKey: 'revenue', color: '#16A34A' })}</div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-panel">
+          <div class="chart-panel-head">Revenue by service</div>
+          ${svgDonutChart(e.byService, { nameKey: 'name', valueKey: 'revenue' })}
+        </div>
+        <div class="chart-panel">
+          <div class="chart-panel-head">Collection rate trend</div>
+          <div class="chart-panel-body">${svgSparkline(e.monthlyCollection, { width: 420, height: 100, valueKey: 'rate', color: '#16A34A' })}</div>
+        </div>
+      </div>
+      <div class="chart-panel" style="margin-bottom:24px">
+        <div class="chart-panel-head">Outstanding vs collected</div>
+        <div class="chart-panel-body">${svgFunnel([
+          { stage: 'Collected', count: e.collected },
+          { stage: 'Outstanding', count: e.outstanding },
+        ])}</div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-panel">
+          <div class="chart-panel-head">Payment methods</div>
+          <div class="chart-panel-body">
+            <table style="width:100%">
+              <thead><tr><th>Method</th><th style="text-align:right">Count</th><th style="text-align:right">Amount</th></tr></thead>
+              <tbody>${e.byMethod.map(m => `<tr><td class="contact-name">${esc(m.method)}</td><td style="text-align:right">${m.count}</td><td style="text-align:right" class="money">${money(m.amount)}</td></tr>`).join('') || '<tr><td colspan="3" class="hint" style="text-align:center;padding:20px">No payments yet</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-panel-head">Transaction counts</div>
+          ${svgDonutChart([
+            { name: 'Paid', count: e.transactionCount.paid },
+            { name: 'Pending', count: e.transactionCount.pending },
+            { name: 'Refunded', count: e.transactionCount.refunded },
+          ])}
+        </div>
+      </div>
+    </div>`;
+}
 
 // ── SIMULATOR ───────────────────────────────────────────────
 function viewSimulator() {

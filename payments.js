@@ -92,4 +92,4 @@ function refund(paymentId) {
   return payments.get(p.id);
 }
 
-module.exports = { createCheckout, sendCheckoutSms, handleStripeEvent, completeDemoPayment, refund, paymentsMode, smsMode };
+module.exports = { createCheckout, sendCheckoutSms, handleStripeEvent, completeDemoPayment, refund, paymentsMode, smsMode, twilioClient: () => twilioClient };

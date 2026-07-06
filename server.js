@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { uid, now, patients, calls, payments, fees } = require('./store');
 const { respond, agentMode } = require('./agent');
-const { createCheckout, sendCheckoutSms, handleStripeEvent, completeDemoPayment, refund, paymentsMode, smsMode } = require('./payments');
+const { createCheckout, sendCheckoutSms, handleStripeEvent, completeDemoPayment, refund, paymentsMode, smsMode, twilioClient: getTwilioClient } = require('./payments');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -48,6 +48,17 @@ app.post('/voice/incoming', async (req, res) => {
     started_at: now(), transcript: [], duration_sec: 0,
     recording_url: null, summary: '', intent: '', sentiment: '',
   });
+
+  // Start recording via Twilio REST API
+  const tc = getTwilioClient();
+  if (tc && req.body.CallSid) {
+    try {
+      await tc.calls(req.body.CallSid).recordings.create({
+        recordingStatusCallback: `${baseUrl()}/voice/recording`,
+        recordingStatusCallbackEvent: ['completed'],
+      });
+    } catch (e) { console.error('Recording start failed:', e.message); }
+  }
 
   const { text } = await respond([]);
   calls.update(call.id, { transcript: [{ role: 'agent', text, t: 0 }] });
@@ -103,6 +114,17 @@ app.post('/voice/status', (req, res) => {
       duration_sec: parseInt(req.body.CallDuration || '0', 10),
       recording_url: req.body.RecordingUrl || call.recording_url,
     });
+  }
+  res.sendStatus(200);
+});
+
+app.post('/voice/recording', (req, res) => {
+  // Twilio recording status callback — save recording URL to call record
+  const callSid = req.body.CallSid;
+  const recordingUrl = req.body.RecordingUrl;
+  if (callSid && recordingUrl) {
+    const call = calls.find(c => c.twilio_sid === callSid);
+    if (call) calls.update(call.id, { recording_url: recordingUrl + '.mp3' });
   }
   res.sendStatus(200);
 });
@@ -257,6 +279,169 @@ app.post('/api/fees', (req, res) => {
   res.json(fees.insert({ code: b.code.toUpperCase(), name: b.name, price: Math.round(b.price * 100), desc: b.desc || '' }));
 });
 app.delete('/api/fees/:id', (req, res) => { fees.remove(req.params.id); res.json({ ok: true }); });
+
+// ════════════════════════════════════════════════════════════
+// REPORTS — aggregated analytics
+// ════════════════════════════════════════════════════════════
+app.get('/api/reports', (req, res) => {
+  const allCalls = calls.all();
+  const allPays = payments.all();
+  const nowMs = Date.now();
+  const day = 86400000;
+
+  // Call volume by day (last 30 days)
+  const callsByDay = [];
+  for (let i = 29; i >= 0; i--) {
+    const start = nowMs - (i + 1) * day;
+    const end = nowMs - i * day;
+    const dayStr = new Date(end).toISOString().slice(5, 10); // MM-DD
+    const count = allCalls.filter(c => c.started_at >= start && c.started_at < end).length;
+    callsByDay.push({ day: dayStr, count });
+  }
+
+  // Peak hours (0-23)
+  const hourCounts = Array(24).fill(0);
+  allCalls.forEach(c => { if (c.started_at) hourCounts[new Date(c.started_at).getHours()]++; });
+
+  // Intent breakdown
+  const intentMap = {};
+  allCalls.forEach(c => { const k = c.intent || 'Unknown'; intentMap[k] = (intentMap[k] || 0) + 1; });
+  const intents = Object.entries(intentMap).map(([name, count]) => ({ name, count }));
+
+  // Sentiment breakdown
+  const sentMap = {};
+  allCalls.forEach(c => { const k = c.sentiment || 'unknown'; sentMap[k] = (sentMap[k] || 0) + 1; });
+  const sentiments = Object.entries(sentMap).map(([name, count]) => ({ name, count }));
+
+  // Avg duration by day (last 30 days)
+  const avgDurationByDay = [];
+  for (let i = 29; i >= 0; i--) {
+    const start = nowMs - (i + 1) * day;
+    const end = nowMs - i * day;
+    const dayStr = new Date(end).toISOString().slice(5, 10);
+    const dayCalls = allCalls.filter(c => c.started_at >= start && c.started_at < end && c.duration_sec);
+    const avg = dayCalls.length ? Math.round(dayCalls.reduce((s, c) => s + c.duration_sec, 0) / dayCalls.length) : 0;
+    avgDurationByDay.push({ day: dayStr, avg });
+  }
+
+  // Conversion funnel
+  const totalCalls = allCalls.length;
+  const linksCreated = allPays.length;
+  const paymentsCompleted = allPays.filter(p => p.status === 'paid').length;
+  const funnel = [
+    { stage: 'Calls', count: totalCalls },
+    { stage: 'Payment links', count: linksCreated },
+    { stage: 'Payments completed', count: paymentsCompleted },
+  ];
+
+  // Top callers
+  const callerMap = {};
+  allCalls.forEach(c => {
+    const key = c.from || 'unknown';
+    if (!callerMap[key]) callerMap[key] = { phone: key, name: null, count: 0 };
+    callerMap[key].count++;
+    if (c.patient_id) {
+      const p = patients.find(x => x.id === c.patient_id);
+      if (p) callerMap[key].name = p.name;
+    }
+  });
+  const topCallers = Object.values(callerMap).sort((a, b) => b.count - a.count).slice(0, 10);
+
+  // Agent performance (live vs simulated)
+  const liveCalls = allCalls.filter(c => !c.simulated).length;
+  const simCalls = allCalls.filter(c => c.simulated).length;
+  const agentPerformance = [
+    { name: 'Live calls', count: liveCalls },
+    { name: 'Simulated', count: simCalls },
+  ];
+
+  res.json({ callsByDay, hourCounts, intents, sentiments, avgDurationByDay, funnel, topCallers, agentPerformance });
+});
+
+// ════════════════════════════════════════════════════════════
+// EARNINGS — revenue analytics
+// ════════════════════════════════════════════════════════════
+app.get('/api/earnings', (req, res) => {
+  const allPays = payments.all();
+  const allCalls = calls.all();
+  const nowMs = Date.now();
+  const day = 86400000;
+
+  const paid = allPays.filter(p => p.status === 'paid');
+  const pending = allPays.filter(p => p.status === 'pending');
+  const refunded = allPays.filter(p => p.status === 'refunded');
+
+  const allTimeRevenue = paid.reduce((s, p) => s + p.amount, 0);
+  const thisMonthStart = new Date(); thisMonthStart.setDate(1); thisMonthStart.setHours(0, 0, 0, 0);
+  const thisMonth = paid.filter(p => p.paid_at >= thisMonthStart.getTime()).reduce((s, p) => s + p.amount, 0);
+  const weekStart = nowMs - 7 * day;
+  const thisWeek = paid.filter(p => p.paid_at >= weekStart).reduce((s, p) => s + p.amount, 0);
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const today = paid.filter(p => p.paid_at >= todayStart.getTime()).reduce((s, p) => s + p.amount, 0);
+
+  const outstanding = pending.reduce((s, p) => s + p.amount, 0);
+  const collected = allTimeRevenue;
+  const avgTransaction = paid.length ? Math.round(allTimeRevenue / paid.length) : 0;
+  const revenuePerCall = allCalls.length ? Math.round(allTimeRevenue / allCalls.length) : 0;
+
+  // Projected monthly: daily avg over last 30 days * 30
+  const last30Paid = paid.filter(p => p.paid_at >= nowMs - 30 * day);
+  const dailyAvg = last30Paid.length ? last30Paid.reduce((s, p) => s + p.amount, 0) / 30 : 0;
+  const projectedMonthly = Math.round(dailyAvg * 30);
+
+  // Revenue by service
+  const serviceMap = {};
+  paid.forEach(p => {
+    const k = p.description || p.fee_code || 'Other';
+    if (!serviceMap[k]) serviceMap[k] = { name: k, revenue: 0, count: 0 };
+    serviceMap[k].revenue += p.amount;
+    serviceMap[k].count++;
+  });
+  const byService = Object.values(serviceMap).sort((a, b) => b.revenue - a.revenue);
+
+  // Payment method breakdown
+  const methodMap = {};
+  paid.forEach(p => {
+    const k = p.method || 'checkout_link';
+    if (!methodMap[k]) methodMap[k] = { method: k, amount: 0, count: 0 };
+    methodMap[k].amount += p.amount;
+    methodMap[k].count++;
+  });
+  const byMethod = Object.values(methodMap);
+
+  // Monthly revenue (last 12 months)
+  const monthlyRevenue = [];
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date();
+    d.setMonth(d.getMonth() - i);
+    const label = d.toISOString().slice(0, 7); // YYYY-MM
+    const mStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+    const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+    const rev = paid.filter(p => p.paid_at >= mStart && p.paid_at < mEnd).reduce((s, p) => s + p.amount, 0);
+    monthlyRevenue.push({ month: label, revenue: rev });
+  }
+
+  // Monthly collection rate
+  const monthlyCollection = [];
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date();
+    d.setMonth(d.getMonth() - i);
+    const label = d.toISOString().slice(0, 7);
+    const mStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+    const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+    const mAll = allPays.filter(p => (p.created_at || 0) >= mStart && (p.created_at || 0) < mEnd);
+    const mPaid = mAll.filter(p => p.status === 'paid');
+    monthlyCollection.push({ month: label, rate: mAll.length ? Math.round(mPaid.length / mAll.length * 100) : 0 });
+  }
+
+  const transactionCount = { paid: paid.length, pending: pending.length, refunded: refunded.length };
+
+  res.json({
+    totals: { allTime: allTimeRevenue, thisMonth, thisWeek, today },
+    outstanding, collected, avgTransaction, revenuePerCall, projectedMonthly,
+    byService, byMethod, monthlyRevenue, monthlyCollection, transactionCount,
+  });
+});
 
 // SPA fallback
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
