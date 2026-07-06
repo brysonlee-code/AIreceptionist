@@ -1,0 +1,17 @@
+{
+  "name": "pinkprint-voice-crm",
+  "version": "1.0.0",
+  "description": "Pink Print Voice CRM \u2014 AI receptionist that answers calls, quotes grant packages, and collects payments (Twilio + Anthropic + Stripe)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "stripe": "^16.8.0",
+    "twilio": "^5.2.2"
+  }
+}

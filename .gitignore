@@ -1,0 +1,5 @@
+node_modules/
+pinkprint.json
+server.log
+.env
+*.log
