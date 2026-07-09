@@ -5,6 +5,7 @@ const path = require('path');
 const { uid, now, patients, calls, payments, fees } = require('./store');
 const { respond, agentMode } = require('./agent');
 const { createCheckout, sendCheckoutSms, handleStripeEvent, completeDemoPayment, refund, paymentsMode, smsMode, twilioClient: getTwilioClient } = require('./payments');
+const { setupAgent, getAgentId } = require('./elevenlabs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,25 @@ const say = (text) => `<Say voice="Polly.Danielle-Neural">${text.replace(/&/g, '
 app.post('/voice/incoming', async (req, res) => {
   const from = req.body.From || 'unknown';
   const patient = patients.find(p => p.phone === from);
+
+  // ── ElevenLabs mode: forward audio via WebSocket ──
+  const elAgentId = getAgentId();
+  if (elAgentId) {
+    calls.insert({
+      twilio_sid: req.body.CallSid || null,
+      patient_id: patient ? patient.id : null,
+      from, direction: 'inbound', status: 'in-progress',
+      started_at: now(), transcript: [], duration_sec: 0,
+      recording_url: null, summary: '', intent: '', sentiment: '',
+      source: 'elevenlabs',
+    });
+    res.type('text/xml').send(twiml(
+      `<Connect><Stream url="wss://api.elevenlabs.io/v1/convai/conversation/twilio?agent_id=${elAgentId}"/></Connect>`
+    ));
+    return;
+  }
+
+  // ── Legacy Twilio STT + Polly path ──
   const call = calls.insert({
     twilio_sid: req.body.CallSid || null,
     patient_id: patient ? patient.id : null,
@@ -127,6 +147,107 @@ app.post('/voice/recording', (req, res) => {
     if (call) calls.update(call.id, { recording_url: recordingUrl + '.mp3' });
   }
   res.sendStatus(200);
+});
+
+// ════════════════════════════════════════════════════════════
+// ELEVENLABS CONVERSATIONAL AI — agent setup + tool endpoints
+// ════════════════════════════════════════════════════════════
+
+// Setup / update the ElevenLabs agent
+app.post('/api/el/setup', async (req, res) => {
+  try {
+    const id = await setupAgent(baseUrl());
+    res.json({ agentId: id, dashboard: `https://elevenlabs.io/app/conversational-ai/${id}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Tool: fee schedule (called by ElevenLabs agent mid-conversation)
+app.get('/api/el/tools/fees', (req, res) => {
+  const feeList = fees.all().map(f => ({
+    code: f.code, name: f.name, price_usd: (f.price / 100).toFixed(2), description: f.desc,
+  }));
+  res.json({ services: feeList });
+});
+
+// Tool: caller lookup (called by ElevenLabs agent at start of call)
+app.post('/api/el/tools/lookup-caller', (req, res) => {
+  const phone = req.body.phone || '';
+  const patient = patients.find(p => p.phone === phone);
+  if (patient) {
+    const history = calls.filter(c => c.patient_id === patient.id).length;
+    res.json({ found: true, name: patient.name, notes: patient.notes, previous_calls: history });
+  } else {
+    res.json({ found: false });
+  }
+});
+
+// Tool: create checkout + send SMS (called by ElevenLabs agent when caller wants to pay)
+app.post('/api/el/tools/send-payment', async (req, res) => {
+  const { fee_code, phone } = req.body;
+  if (!fee_code || !phone) return res.status(400).json({ error: 'fee_code and phone required' });
+
+  const patient = patients.find(p => p.phone === phone);
+  const call = calls.find(c => c.from === phone && c.status === 'in-progress');
+
+  try {
+    const { url, fee } = await createCheckout({
+      feeCode: fee_code, patientId: patient?.id || null, callId: call?.id || null, baseUrl: baseUrl(),
+    });
+    await sendCheckoutSms({ to: phone, url, feeName: fee.name });
+    res.json({ success: true, message: `Checkout link for ${fee.name} sent to ${phone}`, amount: '$' + (fee.price / 100).toFixed(2) });
+  } catch (e) {
+    console.error('EL send-payment failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Post-call webhook: ElevenLabs posts conversation data after the call ends
+app.post('/api/el/call-complete', (req, res) => {
+  const data = req.body;
+  const transcript = [];
+
+  // Parse transcript from ElevenLabs format
+  if (Array.isArray(data.transcript)) {
+    data.transcript.forEach(entry => {
+      const role = entry.role === 'agent' ? 'agent' : 'caller';
+      transcript.push({ role, text: entry.message || entry.text || '', t: entry.time_in_call_secs || 0 });
+    });
+  }
+
+  const phone = data.metadata?.phone || data.phone_number || '';
+  const patient = phone ? patients.find(p => p.phone === phone) : null;
+
+  // Try to find existing in-progress call for this phone
+  let call = phone ? calls.find(c => c.from === phone && c.status === 'in-progress' && c.source === 'elevenlabs') : null;
+
+  const callerLines = transcript.filter(m => m.role === 'caller').map(m => m.text).join(' ');
+  const intent = /pay|checkout|book/i.test(callerLines) ? 'Booking + payment'
+    : /price|cost|how much/i.test(callerLines) ? 'Pricing inquiry' : 'General inquiry';
+  const sentiment = /thank|great|perfect/i.test(callerLines) ? 'positive' : 'neutral';
+
+  const updates = {
+    status: 'completed',
+    transcript,
+    duration_sec: Math.round(data.duration_seconds || data.call_duration_secs || 0),
+    summary: data.summary || data.analysis?.summary || `ElevenLabs call handled by Penny. Intent: ${intent}.`,
+    intent, sentiment,
+    source: 'elevenlabs',
+    el_conversation_id: data.conversation_id || null,
+  };
+
+  if (call) {
+    calls.update(call.id, updates);
+  } else {
+    calls.insert({
+      patient_id: patient?.id || null,
+      from: phone, direction: 'inbound',
+      started_at: now() - (updates.duration_sec * 1000),
+      recording_url: null,
+      ...updates,
+    });
+  }
+
+  res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -227,7 +348,7 @@ app.get('/api/overview', (req, res) => {
   const allPays = payments.all();
   const paid = allPays.filter(p => p.status === 'paid');
   res.json({
-    modes: { agent: agentMode(), payments: paymentsMode(), sms: smsMode(), telephony: process.env.TWILIO_ACCOUNT_SID ? 'twilio' : 'demo' },
+    modes: { agent: agentMode(), payments: paymentsMode(), sms: smsMode(), telephony: process.env.TWILIO_ACCOUNT_SID ? 'twilio' : 'demo', elevenlabs: !!getAgentId() },
     stats: {
       totalCalls: allCalls.length,
       liveCalls: allCalls.filter(c => c.status === 'in-progress').length,
@@ -448,5 +569,7 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 
 app.listen(PORT, () => {
   console.log(`\n  Pink Print Voice CRM → ${baseUrl()}`);
-  console.log(`  Agent: ${agentMode().toUpperCase()} · Payments: ${paymentsMode().toUpperCase()} · Telephony: ${process.env.TWILIO_ACCOUNT_SID ? 'TWILIO' : 'DEMO'}\n`);
+  console.log(`  Agent: ${agentMode().toUpperCase()} · Payments: ${paymentsMode().toUpperCase()} · Telephony: ${process.env.TWILIO_ACCOUNT_SID ? 'TWILIO' : 'DEMO'}`);
+  if (getAgentId()) console.log(`  ElevenLabs agent: ${getAgentId()}`);
+  console.log();
 });

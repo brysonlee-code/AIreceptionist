@@ -52,7 +52,7 @@ function go(v) { state.view = v; render(); }
 // ── SHELL ───────────────────────────────────────────────────
 function render() {
   const m = state.overview?.modes || {};
-  const chip = (label, mode) => `<span class="mode-chip ${mode === 'demo' ? 'mode-demo' : 'mode-live'}">${label}: ${mode.toUpperCase()}</span>`;
+  const chip = (label, mode) => `<span class="mode-chip ${mode === 'demo' ? 'mode-demo' : 'mode-live'}">${label}: ${mode === 'elevenlabs' ? 'ELEVENLABS' : mode.toUpperCase()}</span>`;
   const nav = [
     ['dashboard', 'Dashboard', I.dash, null],
     ['calls', 'Calls', I.phone, state.calls.length],
@@ -77,7 +77,7 @@ function render() {
         </nav>
         <div class="sidebar-foot">
           <div class="mode-chips">
-            ${chip('Agent', m.agent === 'claude' ? 'live' : 'demo')}
+            ${chip('Agent', m.agent === 'elevenlabs' ? 'elevenlabs' : m.agent === 'claude' ? 'live' : 'demo')}
             ${chip('Phone', m.telephony || 'demo')}
             ${chip('Pay', m.payments === 'stripe' ? 'live' : 'demo')}
           </div>
@@ -109,9 +109,11 @@ const stat = (label, value, sub, accent) =>
 // ── DASHBOARD ───────────────────────────────────────────────
 function viewDashboard() {
   const s = state.overview?.stats || {};
+  const m = state.overview?.modes || {};
   const recent = state.calls.slice(0, 6);
+  const elAction = m.elevenlabs ? '' : `<button class="btn btn-sm" onclick="setupElevenLabs()">Setup ElevenLabs</button>`;
   return `
-    ${topbar('Dashboard', 'Penny, your AI receptionist — calls, payments, and enrollments at a glance')}
+    ${topbar('Dashboard', 'Penny, your AI receptionist — calls, payments, and enrollments at a glance', elAction)}
     <div class="content">
       <div class="stat-grid">
         ${stat('Total calls', s.totalCalls ?? 0, s.liveCalls ? `<span class="live-dot"></span>${s.liveCalls} live now` : 'all handled by Penny')}
@@ -583,6 +585,16 @@ async function endSim() {
   state.simCall = null;
   toast('Call ended — transcript saved to Calls');
   await refresh();
+}
+
+// ── ELEVENLABS SETUP ────────────────────────────────────────
+async function setupElevenLabs() {
+  try {
+    const r = await api.post('/el/setup');
+    if (r.error) return toast(r.error);
+    toast('ElevenLabs agent ready: ' + r.agentId);
+    await refresh();
+  } catch (e) { toast('Setup failed — check ELEVENLABS_API_KEY in .env'); }
 }
 
 // Poll for live updates every 5s (payments completing, live calls)
