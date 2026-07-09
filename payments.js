@@ -1,5 +1,6 @@
-// Stripe checkout link creation + SMS delivery via Twilio.
-// Both degrade gracefully to demo mode when keys are absent.
+// Payment link creation + SMS delivery via Twilio.
+// Supports Shopify buy-button URLs, Stripe Checkout, or demo mode.
+// Priority: Shopify URLs (if configured) → Stripe (if key set) → demo.
 
 const { payments, fees, uid } = require('./store');
 
@@ -13,7 +14,19 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
   twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 }
 
-const paymentsMode = () => (stripe ? 'stripe' : 'demo');
+// Parse Shopify checkout URLs from env — format: SHOPIFY_URL_<CODE>=https://...
+// e.g. SHOPIFY_URL_WRITE_GRANT=https://yourstore.myshopify.com/cart/12345:1
+const shopifyUrls = {};
+for (const [key, val] of Object.entries(process.env)) {
+  if (key.startsWith('SHOPIFY_URL_') && val) {
+    // SHOPIFY_URL_WRITE_GRANT → WRITE-GRANT
+    const code = key.replace('SHOPIFY_URL_', '').replace(/_/g, '-');
+    shopifyUrls[code] = val;
+  }
+}
+const hasShopify = Object.keys(shopifyUrls).length > 0;
+
+const paymentsMode = () => (hasShopify ? 'shopify' : stripe ? 'stripe' : 'demo');
 const smsMode = () => (twilioClient ? 'twilio' : 'demo');
 
 // Create a checkout link for a fee code. Returns { url, payment }
@@ -21,7 +34,12 @@ async function createCheckout({ feeCode, patientId, callId, baseUrl }) {
   const fee = fees.find(f => f.code === feeCode) || fees.all()[0];
 
   let url, sessionId;
-  if (stripe) {
+
+  if (shopifyUrls[fee.code]) {
+    // Shopify buy-button / checkout URL — use as-is
+    url = shopifyUrls[fee.code];
+    sessionId = 'shopify_' + uid();
+  } else if (stripe) {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{
@@ -48,7 +66,7 @@ async function createCheckout({ feeCode, patientId, callId, baseUrl }) {
     patient_id: patientId || null, call_id: callId || null,
     fee_code: fee.code, description: fee.name,
     amount: fee.price, currency: 'usd',
-    status: 'pending', method: 'checkout_link',
+    status: 'pending', method: hasShopify ? 'shopify' : 'checkout_link',
     stripe_session_id: sessionId, checkout_url: url,
   });
 
